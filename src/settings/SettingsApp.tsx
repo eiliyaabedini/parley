@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
@@ -67,6 +67,14 @@ import { TranslateSettings } from "./TranslateSettings";
 import { ScenarioSettings } from "./StageBundleSettings";
 import { SaveDestinationPicker } from "../components/SaveDestinationPicker";
 import { PermissionsPanel } from "./PermissionsPanel";
+import {
+  connectAiPass,
+  discoverAiPassModels,
+  disconnectAiPass,
+  getAiPassStatusSnapshot,
+  initializeAiPassStatus,
+  subscribeAiPassStatus,
+} from "../lib/aipass/client";
 
 type Category =
   | "basic"
@@ -130,6 +138,14 @@ export function SettingsApp() {
   const cloudAuth = useStore((s) => s.cloudAuth);
   const [signingIn, setSigningIn] = useState(false);
   const signInAbort = useRef<AbortController | null>(null);
+  const aiPassStatus = useSyncExternalStore(
+    subscribeAiPassStatus,
+    getAiPassStatusSnapshot,
+    getAiPassStatusSnapshot,
+  );
+  const [aiPassModels, setAiPassModels] = useState<string[]>([]);
+  const [aiPassBusy, setAiPassBusy] = useState<"connect" | "disconnect" | "models" | null>(null);
+  const [aiPassError, setAiPassError] = useState<string | null>(null);
 
   async function doSignIn() {
     const controller = new AbortController();
@@ -160,6 +176,80 @@ export function SettingsApp() {
     broadcastSettings({ ...useStore.getState().settings }).catch((error) =>
       log.warn("settings: broadcast failed", { error: String(error) }),
     );
+  }
+
+  const refreshAiPassModels = useCallback(async () => {
+    setAiPassBusy("models");
+    setAiPassError(null);
+    try {
+      const discovered = await discoverAiPassModels();
+      setAiPassModels(discovered);
+      const current = useStore.getState().settings;
+      const fallback = discovered[0];
+      const saved = current.models.aipass;
+      const next = {
+        realtime: discovered.includes(saved.realtime) ? saved.realtime : fallback,
+        deep: discovered.includes(saved.deep) ? saved.deep : fallback,
+      };
+      if (next.realtime !== saved.realtime || next.deep !== saved.deep) {
+        useStore.getState().updateSettings({
+          models: { ...current.models, aipass: next },
+        });
+        await broadcastSettings({ ...useStore.getState().settings });
+      }
+      return discovered;
+    } catch (error) {
+      setAiPassModels([]);
+      setAiPassError(error instanceof Error ? error.message : String(error));
+      return [];
+    } finally {
+      setAiPassBusy(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    void initializeAiPassStatus()
+      .then((status) => {
+        if (status.connected) void refreshAiPassModels();
+      })
+      .catch(() => setAiPassError(t("settings.aipass.statusError")));
+  }, [refreshAiPassModels, settings.language]);
+
+  async function doConnectAiPass() {
+    setAiPassBusy("connect");
+    setAiPassError(null);
+    try {
+      await connectAiPass();
+      await refreshAiPassModels();
+    } catch (error) {
+      setAiPassError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setAiPassBusy(null);
+    }
+  }
+
+  async function doDisconnectAiPass() {
+    setAiPassBusy("disconnect");
+    setAiPassError(null);
+    try {
+      await disconnectAiPass();
+      setAiPassModels([]);
+      const current = useStore.getState().settings;
+      const llmProviders = { ...current.llmProviders };
+      if (llmProviders.realtime === "aipass") llmProviders.realtime = "groq";
+      if (llmProviders.deep === "aipass") llmProviders.deep = "groq";
+      if (
+        llmProviders.realtime !== current.llmProviders.realtime ||
+        llmProviders.deep !== current.llmProviders.deep
+      ) {
+        patch({ llmProviders });
+      }
+    } catch (error) {
+      setAiPassError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setAiPassBusy(null);
+    }
   }
 
   // Enumerate mic devices only on the Transcription tab — doing it on every
@@ -510,6 +600,77 @@ export function SettingsApp() {
             <p className="-mt-1 max-w-md text-[11px] text-muted-foreground">
               {t("settings.provider.workloadsIntro")}
             </p>
+            <div className="flex max-w-xl items-start gap-3 rounded-lg border p-3">
+              <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-violet-500/15">
+                <img src="/providers/aipass.svg" alt="" className="size-6 rounded" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="text-xs font-semibold">{t("settings.aipass.title")}</p>
+                <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
+                  {t("settings.aipass.description")}
+                </p>
+                {aiPassStatus.connected && (
+                  <p className="mt-1 truncate text-[11px] text-emerald-500">
+                    {t("settings.aipass.connected", {
+                      account: aiPassStatus.email || aiPassStatus.displayName || "AI Pass",
+                    })}
+                  </p>
+                )}
+                {!aiPassStatus.configured && (
+                  <p className="mt-1 text-[11px] text-amber-500">
+                    {t("settings.aipass.unavailable")}
+                  </p>
+                )}
+                {aiPassError && (
+                  <p className="mt-1 text-[11px] text-orange-500">{aiPassError}</p>
+                )}
+                <div className="mt-2 flex items-center gap-2">
+                  {aiPassStatus.connected ? (
+                    <>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-7 text-[11px]"
+                        disabled={aiPassBusy !== null}
+                        onClick={() => void doDisconnectAiPass()}
+                      >
+                        {aiPassBusy === "disconnect" && <Loader2 className="size-3 animate-spin" />}
+                        {aiPassBusy === "disconnect"
+                          ? t("settings.aipass.disconnecting")
+                          : t("settings.aipass.disconnect")}
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 text-[11px]"
+                        disabled={aiPassBusy !== null}
+                        onClick={() => void refreshAiPassModels()}
+                      >
+                        {aiPassBusy === "models" && <Loader2 className="size-3 animate-spin" />}
+                        {t("settings.aipass.refreshModels")}
+                      </Button>
+                    </>
+                  ) : (
+                    <Button
+                      size="sm"
+                      className="h-8 text-xs"
+                      disabled={!aiPassStatus.configured || aiPassBusy !== null || !isTauri()}
+                      onClick={() => void doConnectAiPass()}
+                    >
+                      {aiPassBusy === "connect" && <Loader2 className="size-3.5 animate-spin" />}
+                      {aiPassBusy === "connect"
+                        ? t("settings.aipass.connecting")
+                        : t("settings.aipass.connect")}
+                    </Button>
+                  )}
+                  {aiPassStatus.connected && aiPassModels.length > 0 && (
+                    <span className="text-[10px] text-muted-foreground">
+                      {t("settings.aipass.modelsReady", { count: aiPassModels.length })}
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
             {WORKLOADS.map((wl) => {
               const prov = settings.llmProviders[wl];
               const winfo = PROVIDER_BY_ID[prov];
@@ -534,7 +695,11 @@ export function SettingsApp() {
                           // The hosted "parley" provider only exists in the cloud build
                           // and only when signed in (auth IS the gate) — hide it in the
                           // OSS edition and when signed out.
-                          (p) => p.id !== "parley" || (CLOUD_ENABLED && !!cloudAuth),
+                          (p) =>
+                            (p.id !== "parley" || (CLOUD_ENABLED && !!cloudAuth)) &&
+                            (p.id !== "aipass" ||
+                              (aiPassStatus.connected && aiPassModels.length > 0) ||
+                              prov === "aipass"),
                         ).map((p) => (
                           <SelectItem key={p.id} value={p.id}>
                             <span className="flex items-center gap-2">
@@ -560,6 +725,21 @@ export function SettingsApp() {
                     <p className="text-[11px] text-muted-foreground">
                       {t("settings.account.useParley.note", { email: cloudAuth?.user.email ?? "" })}
                     </p>
+                  ) : prov === "aipass" ? (
+                    <Field label={t("settings.provider.model")}>
+                      <ModelSelect
+                        provider={prov}
+                        value={settings.models[prov][wl]}
+                        presets={aiPassModels}
+                        allowCustom={false}
+                        onChange={(v) => patchModel(patch, settings, prov, wl, v)}
+                      />
+                      <p className="text-[11px] text-muted-foreground">
+                        {aiPassStatus.connected
+                          ? t("settings.aipass.modelsHint")
+                          : t("settings.aipass.connectToUse")}
+                      </p>
+                    </Field>
                   ) : (
                     <>
                       <Field label={t("settings.provider.apiKey", { provider: winfo.label })}>
@@ -568,8 +748,8 @@ export function SettingsApp() {
                           placeholder={winfo.requiresKey === false ? t("settings.provider.noKeyNeeded") : winfo.keyPlaceholder}
                           className="max-w-sm"
                           disabled={winfo.requiresKey === false}
-                          value={settings[winfo.apiKeyField]}
-                          onChange={(e) => patch({ [winfo.apiKeyField]: e.target.value } as Partial<Settings>)}
+                          value={settings[winfo.apiKeyField!]}
+                          onChange={(e) => patch({ [winfo.apiKeyField!]: e.target.value } as Partial<Settings>)}
                         />
                       </Field>
                       <Field label={t("settings.provider.model")}>
@@ -1198,22 +1378,28 @@ const CUSTOM_MODEL = "__custom__";
 function ModelSelect({
   provider,
   value,
+  presets: suppliedPresets,
+  allowCustom = true,
   onChange,
 }: Readonly<{
   provider: LlmProvider;
   value: string;
+  presets?: string[];
+  allowCustom?: boolean;
   onChange: (v: string) => void;
 }>) {
   const { t } = useI18n();
-  const presets = PROVIDER_BY_ID[provider].models;
+  const presets = suppliedPresets ?? PROVIDER_BY_ID[provider].models;
   // Custom (free-text) mode: on by default when the saved id isn't a listed
   // preset (e.g. a brand-new model the user typed in before).
-  const [custom, setCustom] = useState(() => !!value && !presets.includes(value));
+  const [custom, setCustom] = useState(
+    () => allowCustom && !!value && !presets.includes(value),
+  );
   // Re-infer when the provider changes (different presets + value).
   useEffect(() => {
-    setCustom(!!value && !presets.includes(value));
+    setCustom(allowCustom && !!value && !presets.includes(value));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [provider]);
+  }, [provider, allowCustom]);
 
   if (custom) {
     return (
@@ -1258,7 +1444,9 @@ function ModelSelect({
             {m}
           </SelectItem>
         ))}
-        <SelectItem value={CUSTOM_MODEL}>{t("settings.provider.customModel")}</SelectItem>
+        {allowCustom && (
+          <SelectItem value={CUSTOM_MODEL}>{t("settings.provider.customModel")}</SelectItem>
+        )}
       </SelectContent>
     </Select>
   );

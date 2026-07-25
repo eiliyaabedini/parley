@@ -199,6 +199,7 @@ export type LlmProvider =
   | "kimi"
   | "ollama"
   | "openrouter"
+  | "aipass"
   | "parley";
 
 /** Reasoning depth for reasoning-capable models (e.g. Groq gpt-oss). */
@@ -358,8 +359,7 @@ export interface Settings {
   ollamaApiKey: string;
   openrouterApiKey: string;
   /** Unused — the hosted "parley" provider authenticates with the Better Auth
-   *  session token, not an API key. Present so it satisfies the closed
-   *  apiKeyField union (every provider has a key field). */
+   *  session token, not an API key. Kept for persisted-settings compatibility. */
   parleyApiKey: string;
   /** Reasoning depth per model role for reasoning-capable models. */
   reasoningEffort: ModelReasoningEfforts;

@@ -1,3 +1,4 @@
+mod aipass;
 mod audio;
 mod capture;
 mod commands;
@@ -77,6 +78,10 @@ pub fn run() {
         // during a meeting without opening a second input stream (see MicTap).
         .manage(MicTap::default())
         .manage(MeetingState::default())
+        // AI Pass keeps no bearer credentials in webview state. This native
+        // owner serializes refresh rotation and tracks cancellable wallet work;
+        // the tokens themselves live only in the macOS Keychain.
+        .manage(aipass::AiPassState::default())
         // Singleton guard for the voice-typing session task (abort-on-restart
         // + bounded post-release flush) — see voice_typing::VoiceTypingState.
         .manage(voice_typing::VoiceTypingState::default())
@@ -112,6 +117,13 @@ pub fn run() {
             commands::save_transcript,
             commands::export_recording,
             commands::start_oauth_loopback,
+            aipass::aipass_connect,
+            aipass::aipass_status,
+            aipass::aipass_models,
+            aipass::aipass_disconnect,
+            aipass::aipass_chat,
+            aipass::aipass_cancel_chat,
+            aipass::aipass_cancel_all_chat,
             commands::read_templates,
             commands::write_templates,
             commands::get_templates_path,

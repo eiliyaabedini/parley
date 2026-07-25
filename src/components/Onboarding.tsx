@@ -202,7 +202,13 @@ export function Onboarding() {
                   {/* The hosted "parley" provider needs a signed-in cloud session:
                       offer it only in the official build once the user signed in at
                       the login step (mirrors the Settings gate). */}
-                  {PROVIDERS.filter((p) => p.id !== "parley" || (CLOUD_ENABLED && !!cloudAuth)).map((p) => (
+                  {PROVIDERS.filter(
+                    // AI Pass is connected and populated through Settings so
+                    // onboarding never invents or hardcodes a wallet model.
+                    (p) =>
+                      p.id !== "aipass" &&
+                      (p.id !== "parley" || (CLOUD_ENABLED && !!cloudAuth)),
+                  ).map((p) => (
                     <SelectItem key={p.id} value={p.id}>
                       <span className="flex items-center gap-2">
                         <img src={p.icon} alt="" className="size-4 rounded-sm" />
@@ -220,8 +226,8 @@ export function Onboarding() {
                 <PasswordInput
                   autoComplete="off"
                   placeholder={llm.keyPlaceholder}
-                  value={(settings[llm.apiKeyField] as string) ?? ""}
-                  onChange={(e) => patch({ [llm.apiKeyField]: e.target.value } as Partial<Settings>)}
+                  value={(settings[llm.apiKeyField!] as string) ?? ""}
+                  onChange={(e) => patch({ [llm.apiKeyField!]: e.target.value } as Partial<Settings>)}
                 />
               )}
             </StepKey>

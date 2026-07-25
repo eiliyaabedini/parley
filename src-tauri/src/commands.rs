@@ -593,7 +593,11 @@ pub fn stop_meeting(
     app: AppHandle,
     state: State<MeetingState>,
     coord: State<MicCoordinator>,
+    aipass: State<crate::aipass::AiPassState>,
 ) -> Result<(), String> {
+    // End wallet-billed upstream work at the native owner before UI teardown.
+    // Cancelling the webview stream alone would leave the HTTP request running.
+    crate::aipass::cancel_all_chat(&aipass);
     let pcm = teardown_meeting(&app, &state, &coord);
 
     // Encode the captured audio off-thread and tell the frontend where it landed
@@ -651,7 +655,9 @@ pub fn cancel_meeting(
     app: AppHandle,
     state: State<MeetingState>,
     coord: State<MicCoordinator>,
+    aipass: State<crate::aipass::AiPassState>,
 ) -> Result<(), String> {
+    crate::aipass::cancel_all_chat(&aipass);
     let pcm = teardown_meeting(&app, &state, &coord);
     if let Some(pcm) = pcm {
         log::info!("meeting: cancelled, discarding {} samples", pcm.len());

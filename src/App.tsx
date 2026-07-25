@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState, useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -33,6 +33,11 @@ import { listenForViewLogsMenu } from "./lib/diagnostics";
 import { listenForLiveTranslateMenu } from "./lib/liveTranslate";
 import { listenForSttUsage } from "./lib/usage/log";
 import { initTemplatesSync } from "./lib/templatesSync";
+import {
+  cancelAllAiPassWork,
+  getAiPassStatusSnapshot,
+  subscribeAiPassStatus,
+} from "./lib/aipass/client";
 import { initSessionSync } from "./lib/sessionSync";
 import { initSessionCommands } from "./lib/sessionCommands";
 import { useThemePreference } from "./lib/theme";
@@ -107,6 +112,12 @@ function useFullscreen(): boolean {
 
 const App = () => {
   useThemePreference();
+  // Re-render provider gates when another window connects/disconnects AI Pass.
+  useSyncExternalStore(
+    subscribeAiPassStatus,
+    getAiPassStatusSnapshot,
+    getAiPassStatusSnapshot,
+  );
   const appMode = useStore((s) => s.appMode);
   const onboarded = useStore((s) => s.settings.onboarded);
   const fullscreen = useFullscreen();
@@ -220,6 +231,7 @@ const App = () => {
     let unlisten: (() => void) | undefined;
     const stopIfRecording = () => {
       if (isMeetingActive(useStore.getState().meetingStatus)) {
+        void cancelAllAiPassWork();
         invoke("stop_meeting").catch((error) => log.warn("meeting: stop on close failed", { error: String(error) }));
       }
     };

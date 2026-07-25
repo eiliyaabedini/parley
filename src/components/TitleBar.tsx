@@ -20,6 +20,7 @@ import { ReplayFolderChip } from "./ReplayFolderChip";
 import { SaveDestinationPicker } from "./SaveDestinationPicker";
 import { PostMeetingReviewButton } from "./accounts/PostMeetingReviewButton";
 import { StudyGenerationChip } from "./study/StudyGenerationChip";
+import { cancelAllAiPassWork } from "../lib/aipass/client";
 
 type TFn = ReturnType<typeof useI18n>["t"];
 type WindowAction = "close" | "minimize" | "fullscreen";
@@ -397,6 +398,9 @@ export function TitleBar({ fullscreen = false }: Readonly<{ fullscreen?: boolean
   async function end() {
     await guarded(async () => {
       log.info("meeting: stop requested");
+      await cancelAllAiPassWork().catch(() => {
+        // The native stop command below repeats cancellation at the transport owner.
+      });
       stopMeeting();
       if (useRealPipeline) {
         // The real save runs async off the `recording-saved` event and takes
@@ -439,6 +443,7 @@ export function TitleBar({ fullscreen = false }: Readonly<{ fullscreen?: boolean
     setConfirmCancel(false);
     await guarded(async () => {
       log.info("meeting: cancel requested");
+      await cancelAllAiPassWork().catch(() => {});
       cancelMeeting();
       if (useRealPipeline) {
         try {
