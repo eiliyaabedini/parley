@@ -22,8 +22,10 @@ let connectionStatus: AiPassConnectionStatus = {
 };
 const listeners = new Set<() => void>();
 let statusListenerStarted = false;
+let statusRevision = 0;
 
 function publishStatus(status: AiPassConnectionStatus) {
+  statusRevision += 1;
   connectionStatus = status;
   for (const listener of listeners) listener();
 }
@@ -66,7 +68,11 @@ async function ensureStatusListener(): Promise<void> {
 export async function initializeAiPassStatus(): Promise<AiPassConnectionStatus> {
   if (!inTauri()) return connectionStatus;
   await ensureStatusListener().catch(() => {});
+  const revisionBeforeRead = statusRevision;
   const status = await invoke<AiPassConnectionStatus>("aipass_status");
+  // A connect/disconnect event delivered while the read was in flight is newer
+  // than its response. Keep the event so startup cannot resurrect stale UI auth.
+  if (statusRevision !== revisionBeforeRead) return connectionStatus;
   publishStatus(status);
   return status;
 }
@@ -127,13 +133,21 @@ export const aiPassNativeFetch: typeof globalThis.fetch = async (_input, init) =
   return new Promise<Response>((resolve, reject) => {
     let settledHeaders = false;
     let finished = false;
+    let cancellationRequested = false;
     let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const cancelNative = () => {
+      if (cancellationRequested) return;
+      cancellationRequested = true;
+      void invoke("aipass_cancel_chat", { requestId });
+    };
     const stream = new ReadableStream<Uint8Array>({
       start(value) {
         controller = value;
       },
       cancel() {
-        void invoke("aipass_cancel_chat", { requestId });
+        cancelNative();
+        finished = true;
+        cleanup();
       },
     });
 
@@ -142,53 +156,58 @@ export const aiPassNativeFetch: typeof globalThis.fetch = async (_input, init) =
       if (finished) return;
       finished = true;
       cleanup();
+      cancelNative();
       const reason =
         error instanceof Error ? error : new Error(typeof error === "string" ? error : message);
       if (settledHeaders) controller?.error(reason);
       else reject(reason);
     };
     const onAbort = () => {
-      void invoke("aipass_cancel_chat", { requestId });
       fail("AI Pass request cancelled", new DOMException("The operation was aborted", "AbortError"));
     };
 
     events.onmessage = (message) => {
       if (finished) return;
-      switch (message.type) {
-        case "headers": {
-          if (settledHeaders) {
-            fail("AI Pass transport returned duplicate headers");
-            return;
-          }
-          settledHeaders = true;
-          if (message.status === 401) markDisconnected();
-          resolve(
-            new Response(stream, {
+      try {
+        switch (message.type) {
+          case "headers": {
+            if (settledHeaders) {
+              fail("AI Pass transport returned duplicate headers");
+              return;
+            }
+            const response = new Response(stream, {
               status: message.status,
               headers: { "Content-Type": message.content_type },
-            }),
-          );
-          break;
+            });
+            settledHeaders = true;
+            if (message.status === 401) markDisconnected();
+            resolve(response);
+            break;
+          }
+          case "data":
+            if (!settledHeaders) {
+              fail("AI Pass transport returned data before headers");
+              return;
+            }
+            controller?.enqueue(decodeBase64(message.data));
+            break;
+          case "done":
+            if (!settledHeaders) {
+              fail("AI Pass transport ended before headers");
+              return;
+            }
+            finished = true;
+            cleanup();
+            controller?.close();
+            break;
+          case "error":
+            fail(message.message);
+            break;
+          default:
+            fail("AI Pass transport returned an invalid event");
         }
-        case "data":
-          if (!settledHeaders) {
-            fail("AI Pass transport returned data before headers");
-            return;
-          }
-          controller?.enqueue(decodeBase64(message.data));
-          break;
-        case "done":
-          if (!settledHeaders) {
-            fail("AI Pass transport ended before headers");
-            return;
-          }
-          finished = true;
-          cleanup();
-          controller?.close();
-          break;
-        case "error":
-          fail(message.message);
-          break;
+      } catch (error) {
+        fail("AI Pass transport returned invalid response data", error);
       }
     };
 

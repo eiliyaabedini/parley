@@ -32,6 +32,7 @@ const EXPECTED_ISSUER: &str = "https://aipass.one";
 const KEYCHAIN_SERVICE: &str = "com.pathors.parley.aipass";
 const KEYCHAIN_ACCOUNT: &str = "oauth-tokens-v1";
 const STATUS_EVENT: &str = "aipass://status";
+const REQUIRED_SCOPE: &str = "api:access profile:read";
 
 const OAUTH_TIMEOUT: Duration = Duration::from_secs(180);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -240,6 +241,8 @@ fn validate_metadata(value: &Value) -> Result<OAuthMetadata, String> {
         || !endpoint_is_pinned_https(&metadata.token_endpoint)
         || !endpoint_is_pinned_https(&metadata.userinfo_endpoint)
         || !endpoint_is_pinned_https(&metadata.revocation_endpoint)
+        || !array_contains(&value["scopes_supported"], "api:access")
+        || !array_contains(&value["scopes_supported"], "profile:read")
         || !array_contains(&value["response_types_supported"], "code")
         || !array_contains(&value["grant_types_supported"], "authorization_code")
         || !array_contains(&value["grant_types_supported"], "refresh_token")
@@ -333,7 +336,7 @@ fn build_authorization_url(
         .append_pair("client_id", client_id)
         .append_pair("response_type", "code")
         .append_pair("redirect_uri", redirect_uri)
-        .append_pair("scope", "api:access profile:read")
+        .append_pair("scope", REQUIRED_SCOPE)
         .append_pair("state", state)
         .append_pair("code_challenge", code_challenge)
         .append_pair("code_challenge_method", "S256");
@@ -485,24 +488,55 @@ async fn wait_for_callback(
     }
 }
 
+#[derive(Default, Zeroize, ZeroizeOnDrop)]
+struct TokenResponseSecrets {
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    scope: Option<String>,
+}
+
+fn take_token_string(
+    object: &mut serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<String>, String> {
+    match object.remove(field) {
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err("AI Pass token response is invalid".into()),
+        None => Ok(None),
+    }
+}
+
 fn parse_token_response(
-    value: &Value,
+    value: &mut Value,
     previous_refresh_token: Option<&str>,
     previous_scope: Option<&str>,
 ) -> Result<TokenBundle, String> {
-    let access_token = value
-        .get("access_token")
-        .and_then(Value::as_str)
-        .filter(|token| !token.is_empty() && token.len() <= 16 * 1024)
-        .ok_or_else(|| "AI Pass returned an invalid access token".to_string())?
-        .to_owned();
-    let refresh_token = value
-        .get("refresh_token")
-        .and_then(Value::as_str)
-        .filter(|token| !token.is_empty() && token.len() <= 16 * 1024)
-        .or(previous_refresh_token)
-        .ok_or_else(|| "AI Pass did not return a refresh token".to_string())?
-        .to_owned();
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "AI Pass token response is invalid".to_string())?;
+    // Populate sequentially so any later parse error drops and zeroizes fields
+    // already removed from the generic JSON value.
+    let mut secrets = TokenResponseSecrets::default();
+    secrets.access_token = take_token_string(object, "access_token")?;
+    secrets.refresh_token = take_token_string(object, "refresh_token")?;
+    secrets.scope = take_token_string(object, "scope")?;
+    if !secrets
+        .access_token
+        .as_deref()
+        .is_some_and(|token| !token.is_empty() && token.len() <= 16 * 1024)
+    {
+        return Err("AI Pass returned an invalid access token".into());
+    }
+    if secrets
+        .refresh_token
+        .as_deref()
+        .is_some_and(|token| token.is_empty() || token.len() > 16 * 1024)
+    {
+        return Err("AI Pass returned an invalid refresh token".into());
+    }
+    if secrets.refresh_token.is_none() && previous_refresh_token.is_none() {
+        return Err("AI Pass did not return a refresh token".into());
+    }
     if !value
         .get("token_type")
         .and_then(Value::as_str)
@@ -516,17 +550,38 @@ fn parse_token_response(
         .filter(|seconds| *seconds > 0 && *seconds <= 31_536_000)
         .ok_or_else(|| "AI Pass returned an invalid token lifetime".to_string())?;
     let expires_at_epoch_seconds = now_epoch_seconds()?.saturating_add(expires_in);
-    let scope = value
-        .get("scope")
-        .and_then(Value::as_str)
-        .filter(|scope| scope.len() <= 4096)
-        .or(previous_scope)
-        .ok_or_else(|| "AI Pass token scope is missing".to_string())?
-        .to_owned();
-    let granted: HashSet<&str> = scope.split_ascii_whitespace().collect();
-    if !granted.contains("api:access") || !granted.contains("profile:read") {
-        return Err("AI Pass did not grant the required scopes".into());
+    if secrets
+        .scope
+        .as_deref()
+        .is_some_and(|scope| scope.is_empty() || scope.len() > 4096)
+    {
+        return Err("AI Pass token scope is invalid".into());
     }
+    {
+        let scope = secrets
+            .scope
+            .as_deref()
+            .or(previous_scope)
+            .ok_or_else(|| "AI Pass token scope is missing".to_string())?;
+        let granted: HashSet<&str> = scope.split_ascii_whitespace().collect();
+        if !granted.contains("api:access") || !granted.contains("profile:read") {
+            return Err("AI Pass did not grant the required scopes".into());
+        }
+    }
+    let access_token = secrets
+        .access_token
+        .take()
+        .ok_or_else(|| "AI Pass returned an invalid access token".to_string())?;
+    let refresh_token = secrets
+        .refresh_token
+        .take()
+        .or_else(|| previous_refresh_token.map(str::to_owned))
+        .ok_or_else(|| "AI Pass did not return a refresh token".to_string())?;
+    let scope = secrets
+        .scope
+        .take()
+        .or_else(|| previous_scope.map(str::to_owned))
+        .ok_or_else(|| "AI Pass token scope is missing".to_string())?;
     Ok(TokenBundle {
         access_token,
         refresh_token,
@@ -558,10 +613,11 @@ async fn exchange_code(
     if !response.status().is_success() {
         return Err("AI Pass token exchange was rejected".into());
     }
-    let body = read_limited(response, MAX_TOKEN_BYTES, Duration::from_secs(10)).await?;
-    let value: Value = serde_json::from_slice(&body)
+    let body =
+        Zeroizing::new(read_limited(response, MAX_TOKEN_BYTES, Duration::from_secs(10)).await?);
+    let mut value: Value = serde_json::from_slice(&body)
         .map_err(|_| "AI Pass token response is invalid".to_string())?;
-    parse_token_response(&value, None, None)
+    parse_token_response(&mut value, None, Some(REQUIRED_SCOPE))
 }
 
 fn clipped_profile_field(value: Option<&str>) -> Option<String> {
@@ -710,7 +766,8 @@ pub fn aipass_status() -> Result<ConnectionStatus, String> {
     }
 }
 
-fn clear_connection(app: &AppHandle) -> Result<(), String> {
+fn clear_connection(app: &AppHandle, state: &AiPassState) -> Result<(), String> {
+    cancel_all_chat(state);
     keychain_delete()?;
     let _ = app.emit(STATUS_EVENT, ConnectionStatus::disconnected());
     Ok(())
@@ -743,7 +800,7 @@ async fn refresh_access_token(
     let status = response.status();
     if !status.is_success() {
         if matches!(status, StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED) {
-            clear_connection(app)?;
+            clear_connection(app, state)?;
             return Err("AI Pass connection expired; connect it again in Settings".into());
         }
         return Err("AI Pass session refresh failed".into());
@@ -751,30 +808,35 @@ async fn refresh_access_token(
     let body = match read_limited(response, MAX_TOKEN_BYTES, Duration::from_secs(10)).await {
         Ok(body) => body,
         Err(error) => {
-            let _ = clear_connection(app);
+            let _ = clear_connection(app, state);
             return Err(error);
         }
     };
-    let value: Value = match serde_json::from_slice(&body) {
+    let mut body = Zeroizing::new(body);
+    let mut value: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => {
-            let _ = clear_connection(app);
+            body.zeroize();
+            let _ = clear_connection(app, state);
             return Err("AI Pass token response is invalid".into());
         }
     };
-    let mut rotated =
-        match parse_token_response(&value, Some(&tokens.refresh_token), tokens.scope.as_deref()) {
-            Ok(rotated) => rotated,
-            Err(error) => {
-                let _ = clear_connection(app);
-                return Err(error);
-            }
-        };
+    let mut rotated = match parse_token_response(
+        &mut value,
+        Some(&tokens.refresh_token),
+        tokens.scope.as_deref(),
+    ) {
+        Ok(rotated) => rotated,
+        Err(error) => {
+            let _ = clear_connection(app, state);
+            return Err(error);
+        }
+    };
     rotated.profile = tokens.profile.clone();
     // Security.framework performs SecItemUpdate atomically, so the new access
     // token and rotated refresh token replace the old bundle as one Keychain item.
     if let Err(error) = keychain_save(&rotated) {
-        let _ = clear_connection(app);
+        let _ = clear_connection(app, state);
         return Err(error);
     }
     Ok(Zeroizing::new(rotated.access_token.clone()))
@@ -886,7 +948,7 @@ pub async fn aipass_models(
     if response.status() == StatusCode::UNAUTHORIZED {
         response = authenticated_models_request(&state, &app, true).await?;
         if response.status() == StatusCode::UNAUTHORIZED {
-            clear_connection(&app)?;
+            clear_connection(&app, &state)?;
         }
     }
     if !response.status().is_success() {
@@ -913,13 +975,18 @@ pub async fn aipass_disconnect(
     app: AppHandle,
     state: State<'_, AiPassState>,
 ) -> Result<ConnectionStatus, String> {
+    // Cancel before waiting for a refresh holder. Otherwise an in-flight chat
+    // can finish refreshing and begin billable work while disconnect is queued
+    // on the credential mutex.
+    cancel_all_chat(&state);
     let _connect_guard = state.connect_lock.lock().await;
     let _credential_guard = state.refresh_lock.lock().await;
+    // Cover work registered while the async locks were being acquired.
     cancel_all_chat(&state);
     let tokens = keychain_load()?;
     // Clear local authority first. Revocation is best-effort so an unavailable
     // network can never leave the account connected on this device.
-    clear_connection(&app)?;
+    let clear_result = clear_connection(&app, &state);
     if let (Some(tokens), Some(client_id)) = (tokens, client_id()) {
         if let Ok(metadata) = fetch_metadata(&state.client).await {
             revoke_token(
@@ -938,6 +1005,7 @@ pub async fn aipass_disconnect(
             .await;
         }
     }
+    clear_result?;
     Ok(ConnectionStatus::disconnected())
 }
 
@@ -1122,7 +1190,7 @@ async fn run_chat(
     if response.status() == StatusCode::UNAUTHORIZED {
         response = authenticated_chat_request(state, app, body, true, cancellation).await?;
         if response.status() == StatusCode::UNAUTHORIZED {
-            clear_connection(app)?;
+            clear_connection(app, state)?;
         }
     }
     stream_chat_response(response, events, cancellation).await
@@ -1284,6 +1352,7 @@ mod tests {
             "token_endpoint": "https://aipass.one/oauth2/token",
             "userinfo_endpoint": "https://aipass.one/oauth2/userinfo",
             "revocation_endpoint": "https://aipass.one/oauth2/revoke",
+            "scopes_supported": ["api:access", "profile:read"],
             "response_types_supported": ["code"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
             "code_challenge_methods_supported": ["S256"],
@@ -1294,27 +1363,32 @@ mod tests {
         let mut wrong_host = metadata;
         wrong_host["token_endpoint"] = json!("https://attacker.example/oauth2/token");
         assert!(validate_metadata(&wrong_host).is_err());
+
+        let mut missing_scope = wrong_host;
+        missing_scope["token_endpoint"] = json!("https://aipass.one/oauth2/token");
+        missing_scope["scopes_supported"] = json!(["profile:read"]);
+        assert!(validate_metadata(&missing_scope).is_err());
     }
 
     #[test]
     fn token_rotation_requires_bearer_and_preserves_required_scope() {
-        let initial = json!({
+        let mut initial = json!({
             "access_token": "access-1",
             "refresh_token": "refresh-1",
             "expires_in": 3600,
             "token_type": "Bearer",
             "scope": "api:access profile:read"
         });
-        let tokens = parse_token_response(&initial, None, None).expect("initial tokens");
+        let tokens = parse_token_response(&mut initial, None, None).expect("initial tokens");
         assert_eq!(tokens.refresh_token, "refresh-1");
 
-        let rotated = json!({
+        let mut rotated = json!({
             "access_token": "access-2",
             "expires_in": 3600,
             "token_type": "bearer"
         });
         let next = parse_token_response(
-            &rotated,
+            &mut rotated,
             Some(&tokens.refresh_token),
             tokens.scope.as_deref(),
         )
@@ -1322,14 +1396,27 @@ mod tests {
         assert_eq!(next.refresh_token, "refresh-1");
         assert_eq!(next.scope.as_deref(), Some("api:access profile:read"));
 
-        let insufficient = json!({
+        let mut malformed_rotation = json!({
+            "access_token": "access-3",
+            "refresh_token": "",
+            "expires_in": 3600,
+            "token_type": "Bearer"
+        });
+        assert!(parse_token_response(
+            &mut malformed_rotation,
+            Some(&tokens.refresh_token),
+            tokens.scope.as_deref(),
+        )
+        .is_err());
+
+        let mut insufficient = json!({
             "access_token": "access",
             "refresh_token": "refresh",
             "expires_in": 3600,
             "token_type": "Bearer",
             "scope": "profile:read"
         });
-        assert!(parse_token_response(&insufficient, None, None).is_err());
+        assert!(parse_token_response(&mut insufficient, None, None).is_err());
     }
 
     #[test]

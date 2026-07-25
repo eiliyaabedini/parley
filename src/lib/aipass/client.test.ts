@@ -2,6 +2,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
+  listen: vi.fn(
+    (
+      _event: string,
+      _handler: (event: {
+        payload: { configured: boolean; connected: boolean };
+      }) => void,
+    ) => Promise.resolve(() => {}),
+  ),
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -12,10 +20,14 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn(() => Promise.resolve(() => {})),
+  listen: mocks.listen,
 }));
 
-import { aiPassNativeFetch } from "./client";
+import {
+  aiPassNativeFetch,
+  getAiPassStatusSnapshot,
+  initializeAiPassStatus,
+} from "./client";
 
 describe("AI Pass native fetch bridge", () => {
   beforeEach(() => {
@@ -86,5 +98,63 @@ describe("AI Pass native fetch bridge", () => {
       "aipass_cancel_chat",
       expect.objectContaining({ requestId: expect.any(String) }),
     );
+  });
+
+  it("cancels native work when the stream protocol is invalid", async () => {
+    mocks.invoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "aipass_chat") {
+        const channel = args?.onEvent as { onmessage: (message: unknown) => void };
+        queueMicrotask(() => {
+          channel.onmessage({
+            type: "headers",
+            status: 200,
+            content_type: "text/event-stream",
+          });
+          channel.onmessage({
+            type: "headers",
+            status: 200,
+            content_type: "text/event-stream",
+          });
+        });
+        return new Promise(() => {});
+      }
+      return Promise.resolve();
+    });
+
+    const response = await aiPassNativeFetch("https://aipass.one/oauth2/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({ model: "live/model", messages: [] }),
+    });
+
+    await expect(response.text()).rejects.toThrow("duplicate headers");
+    expect(mocks.invoke).toHaveBeenCalledWith(
+      "aipass_cancel_chat",
+      expect.objectContaining({ requestId: expect.any(String) }),
+    );
+  });
+
+  it("does not overwrite a newer status event with a stale status read", async () => {
+    let resolveStatus:
+      | ((status: { configured: boolean; connected: boolean }) => void)
+      | undefined;
+    mocks.invoke.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveStatus = resolve;
+        }),
+    );
+
+    const pending = initializeAiPassStatus();
+    await vi.waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith("aipass_status"));
+    const statusHandler = mocks.listen.mock.calls[0]?.[1] as
+      | ((event: { payload: { configured: boolean; connected: boolean } }) => void)
+      | undefined;
+    expect(statusHandler).toBeDefined();
+
+    statusHandler!({ payload: { configured: true, connected: false } });
+    resolveStatus!({ configured: true, connected: true });
+
+    await expect(pending).resolves.toMatchObject({ connected: false });
+    expect(getAiPassStatusSnapshot()).toMatchObject({ connected: false });
   });
 });
