@@ -26,7 +26,7 @@ use url::Url;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const DISCOVERY_URL: &str = "https://aipass.one/.well-known/oauth-authorization-server";
-const MODELS_URL: &str = "https://aipass.one/oauth2/v1/models?detailed=true";
+const MODELS_URL: &str = "https://aipass.one/oauth2/v1/models?type=text&method=chat_completions";
 const CHAT_URL: &str = "https://aipass.one/oauth2/v1/chat/completions";
 const EXPECTED_ISSUER: &str = "https://aipass.one";
 const KEYCHAIN_SERVICE: &str = "com.pathors.parley.aipass";
@@ -842,57 +842,18 @@ async fn refresh_access_token(
     Ok(Zeroizing::new(rotated.access_token.clone()))
 }
 
-fn signal_strings(value: Option<&Value>) -> Vec<String> {
-    match value {
-        Some(Value::String(value)) => vec![value.to_ascii_lowercase()],
-        Some(Value::Array(values)) => values
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_ascii_lowercase)
-            .collect(),
-        Some(Value::Object(values)) => values
-            .iter()
-            .filter(|(_, enabled)| enabled.as_bool().unwrap_or(false))
-            .map(|(key, _)| key.to_ascii_lowercase())
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn model_supports_chat(model: &serde_json::Map<String, Value>) -> bool {
-    let methods = signal_strings(model.get("methods").or_else(|| model.get("method")));
-    let capabilities = signal_strings(
-        model
-            .get("capabilities")
-            .or_else(|| model.get("capability")),
-    );
-    let types = signal_strings(model.get("type"));
-    let has_explicit_metadata =
-        !methods.is_empty() || !capabilities.is_empty() || !types.is_empty();
-    if !has_explicit_metadata {
-        // Older OpenAI-list objects expose only id/object/created/owned_by.
-        return true;
-    }
-    methods
-        .iter()
-        .any(|method| method.contains("chat") || method.contains("completion"))
-        || capabilities
-            .iter()
-            .any(|capability| matches!(capability.as_str(), "chat" | "text" | "completion"))
-        || types
-            .iter()
-            .any(|kind| matches!(kind.as_str(), "chat" | "text" | "llm"))
-}
-
 fn parse_model_ids(value: &Value) -> Result<Vec<String>, String> {
-    let entries = match value {
-        Value::Array(entries) => entries,
-        Value::Object(object) if object.get("object").and_then(Value::as_str) == Some("list") => {
+    let (entries, openai_envelope) = match value {
+        // Keep accepting the pre-OpenAI string-array migration shape, but
+        // validate the default envelope against the standard model contract.
+        Value::Array(entries) => (entries, false),
+        Value::Object(object) if object.get("object").and_then(Value::as_str) == Some("list") => (
             object
                 .get("data")
                 .and_then(Value::as_array)
-                .ok_or_else(|| "AI Pass model list is invalid".to_string())?
-        }
+                .ok_or_else(|| "AI Pass model list is invalid".to_string())?,
+            true,
+        ),
         _ => return Err("AI Pass model list is invalid".into()),
     };
     if entries.len() > MAX_MODELS {
@@ -902,26 +863,34 @@ fn parse_model_ids(value: &Value) -> Result<Vec<String>, String> {
     let mut seen = HashSet::new();
     let mut models = Vec::new();
     for entry in entries {
-        let (id, include) = match entry {
-            Value::String(id) => (id.as_str(), true),
-            Value::Object(model) => (
+        let id = match (openai_envelope, entry) {
+            (true, Value::Object(model)) => {
+                if model.get("object").and_then(Value::as_str) != Some("model")
+                    || model.get("created").and_then(Value::as_u64).is_none()
+                    || model
+                        .get("owned_by")
+                        .and_then(Value::as_str)
+                        .is_none_or(str::is_empty)
+                {
+                    return Err("AI Pass model entry is invalid".into());
+                }
                 model
                     .get("id")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| "AI Pass model entry is invalid".to_string())?,
-                model_supports_chat(model),
-            ),
+                    .ok_or_else(|| "AI Pass model entry is invalid".to_string())?
+            }
+            (false, Value::String(id)) => id,
             _ => return Err("AI Pass model entry is invalid".into()),
         };
         if id.is_empty() || id.len() > MAX_MODEL_ID_BYTES || id.chars().any(char::is_control) {
             return Err("AI Pass model id is invalid".into());
         }
-        if include && seen.insert(id.to_owned()) {
+        if seen.insert(id.to_owned()) {
             models.push(id.to_owned());
         }
     }
     if models.is_empty() {
-        return Err("AI Pass returned no chat-capable models".into());
+        return Err("AI Pass returned no models".into());
     }
     Ok(models)
 }
@@ -1315,25 +1284,56 @@ mod tests {
     }
 
     #[test]
-    fn model_discovery_accepts_openai_and_legacy_shapes_without_hardcoding_ids() {
-        let detailed = json!({
+    fn model_discovery_uses_openai_contract_and_server_side_chat_filters() {
+        assert_eq!(
+            MODELS_URL,
+            "https://aipass.one/oauth2/v1/models?type=text&method=chat_completions"
+        );
+
+        let openai = json!({
             "object": "list",
             "data": [
-                {"id": "provider/new-chat-model", "methods": ["chat.completions"]},
-                {"id": "provider/image-model", "methods": ["images.generations"]},
-                {"id": "provider/other-chat-model", "capabilities": ["chat"]}
+                {
+                    "id": "provider/new-chat-model",
+                    "object": "model",
+                    "created": 1_753_000_000_u64,
+                    "owned_by": "provider",
+                    "future_additive_field": {"nested": true}
+                },
+                {
+                    "id": "another-provider/model:version",
+                    "object": "model",
+                    "created": 1_753_000_001_u64,
+                    "owned_by": "another-provider"
+                }
             ]
         });
         assert_eq!(
-            parse_model_ids(&detailed).expect("detailed models"),
-            vec!["provider/new-chat-model", "provider/other-chat-model"]
+            parse_model_ids(&openai).expect("OpenAI-compatible models"),
+            vec!["provider/new-chat-model", "another-provider/model:version"]
         );
 
+        for missing in ["object", "created", "owned_by"] {
+            let mut malformed = openai.clone();
+            malformed["data"][0]
+                .as_object_mut()
+                .expect("model object")
+                .remove(missing);
+            assert!(
+                parse_model_ids(&malformed).is_err(),
+                "canonical model missing {missing} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn model_discovery_accepts_legacy_string_arrays_for_migration() {
         let legacy = json!(["future/model-a", "future/model-b", "future/model-a"]);
         assert_eq!(
             parse_model_ids(&legacy).expect("legacy models"),
             vec!["future/model-a", "future/model-b"]
         );
+        assert!(parse_model_ids(&json!([{"id": "legacy/object-model"}])).is_err());
     }
 
     #[test]
