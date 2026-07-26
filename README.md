@@ -137,6 +137,35 @@ bun install
 bun run tauri dev
 ```
 
+### Optional AI Pass evaluation and maintainer replacement
+
+Parley keeps every existing provider. Users who choose AI Pass install Parley
+and click **Connect AI Pass** without obtaining or pasting model API keys;
+requests spend from their own shared AI Pass wallet.
+
+For evaluation only, our fork/private test build may inject AI Pass's existing
+first-party PUBLIC client ID from protected CI/build configuration, but only
+when Parley's exact runtime callback is registered for that client. The client
+ID is not an API key or client secret, is never committed or printed, and this
+shortcut is not upstream release guidance.
+
+To replace the evaluation client with your own:
+
+1. Register **Parley** at the
+   [AI Pass Developer Dashboard](https://aipass.one/panel/developer).
+2. Register Parley's exact loopback callback:
+   `http://127.0.0.1:<ephemeral-port>/oauth/callback`. Parley selects the port
+   at runtime; the host and path are fixed.
+3. Set protected native build variable `AIPASS_CLIENT_ID` to your own public
+   client ID.
+
+Using your own OAuth client attributes eligible paid usage to Parley's
+integration and may earn developer revenue share under the
+[AI Pass Terms of Service](https://aipass.one/terms-of-service). Free, trial,
+promotional, grant, bonus, and other unpaid usage is excluded; dashboard terms
+govern rates, eligibility, and payouts. This is optional context, not a
+guarantee or a reason to merge. Thank you for considering the contribution.
+
 *(optional)* Build and install the virtual-microphone driver for translation into meetings:
 
 ```bash
