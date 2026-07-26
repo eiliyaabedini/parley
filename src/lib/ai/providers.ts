@@ -29,7 +29,7 @@ export interface ProviderInfo {
   /** Base URL for openai-compatible providers. */
   baseURL?: string;
   /** Which Settings field holds this provider's API key. */
-  apiKeyField:
+  apiKeyField?:
     | "anthropicApiKey"
     | "openaiApiKey"
     | "geminiApiKey"
@@ -170,6 +170,21 @@ export const PROVIDERS: ProviderInfo[] = [
       "openai/gpt-oss-120b",
     ],
     defaults: { realtime: "anthropic/claude-haiku-4.5", deep: "openai/gpt-5.5" },
+  },
+  {
+    id: "aipass",
+    label: "AI Pass",
+    note: "provider.note.aipass",
+    tag: { label: "provider.tag.wallet", tone: "value" },
+    icon: "/providers/aipass.svg",
+    kind: "openai-compatible",
+    baseURL: "https://aipass.one/oauth2/v1",
+    keyPlaceholder: "",
+    requiresKey: false,
+    // Populated only by authenticated live discovery. Empty defaults ensure a
+    // model id is never baked into the application or silently invented.
+    models: [],
+    defaults: { realtime: "", deep: "" },
   },
   {
     id: "parley",

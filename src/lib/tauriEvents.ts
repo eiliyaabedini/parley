@@ -6,6 +6,7 @@ import { toTraditional } from "./zhConvert";
 import { log } from "./log";
 import { translate, type TranslationKey } from "../i18n/messages";
 import type { Source } from "./types";
+import { cancelAllAiPassWork } from "./aipass/client";
 
 /** Shape of the `transcript://segment` payload emitted by the Rust backend. */
 interface TranscriptEventPayload {
@@ -129,6 +130,7 @@ export async function listenForMeetingError(): Promise<UnlistenFn> {
   return listen<MeetingErrorPayload>("meeting://error", (event) => {
     const { code } = event.payload;
     // Tear the (transcript-less) meeting down so the UI leaves "recording".
+    void cancelAllAiPassWork();
     useStore.getState().stopMeeting();
     invoke("stop_meeting").catch((error) =>
       log.warn("meeting: stop after backend error failed", { code, error: String(error) }),

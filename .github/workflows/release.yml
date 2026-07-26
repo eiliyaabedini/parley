@@ -30,6 +30,9 @@ jobs:
       APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
       APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
       APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+      # Public OAuth client identifier, injected into the native Rust binary.
+      # It is never exposed through Vite/browser configuration.
+      AIPASS_CLIENT_ID: ${{ secrets.AIPASS_CLIENT_ID }}
 
     steps:
       - name: Checkout

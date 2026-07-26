@@ -5,6 +5,7 @@ import type { LlmWorkload, Settings } from "../types";
 import { PROVIDER_BY_ID, isReasoningModel } from "./providers";
 import { cloudToken, CLOUD_URL } from "../cloud/client";
 import { CLOUD_ENABLED } from "../flags";
+import { aiPassNativeFetch } from "../aipass/client";
 
 export { isReasoningModel } from "./providers";
 
@@ -46,7 +47,20 @@ export function getModel(
   const provider = settings.llmProviders[workload];
   const info = PROVIDER_BY_ID[provider];
   const modelId = settings.models[provider][workload];
-  const apiKey = settings[info.apiKeyField];
+  const apiKey = info.apiKeyField ? settings[info.apiKeyField] : "";
+
+  if (info.id === "aipass") {
+    if (!modelId) {
+      throw new Error("Connect AI Pass and choose a discovered model in Settings");
+    }
+    const aipass = createOpenAICompatible({
+      name: info.id,
+      baseURL: info.baseURL!,
+      fetch: aiPassNativeFetch,
+      supportsStructuredOutputs: false,
+    });
+    return aipass.chatModel(modelId);
+  }
 
   if (info.kind === "anthropic") {
     const anthropic = createAnthropic({

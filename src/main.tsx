@@ -5,6 +5,7 @@ import "./index.css";
 import { attachConsoleOnce, log } from "./lib/log";
 import { initFolderRegistry } from "./lib/history/folders";
 import { initZoomShortcuts } from "./lib/zoom";
+import { initializeAiPassStatus } from "./lib/aipass/client";
 
 // Mirror webview console.* into the rotating log file (no-op outside Tauri).
 void attachConsoleOnce();
@@ -82,10 +83,17 @@ function Root() {
   }
 }
 
-ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
-  <React.StrictMode>
-    <Suspense fallback={null}>
-      <Root />
-    </Suspense>
-  </React.StrictMode>,
-);
+async function bootstrap() {
+  // Hydrate only non-sensitive connection metadata before any provider gate
+  // renders. OAuth tokens never cross the native boundary and remain in Keychain.
+  await initializeAiPassStatus().catch(() => log.warn("aipass: status init failed"));
+  ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
+    <React.StrictMode>
+      <Suspense fallback={null}>
+        <Root />
+      </Suspense>
+    </React.StrictMode>,
+  );
+}
+
+void bootstrap();

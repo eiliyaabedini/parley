@@ -38,7 +38,7 @@ export interface SttProviderInfo {
  */
 function fromLlm(id: "openai" | "gemini"): Omit<SttProviderInfo, "diarization" | "supportsFileUpload"> {
   const p = PROVIDER_BY_ID[id];
-  return { id, label: p.label, apiKeyField: p.apiKeyField, keyPlaceholder: p.keyPlaceholder, icon: p.icon };
+  return { id, label: p.label, apiKeyField: p.apiKeyField!, keyPlaceholder: p.keyPlaceholder, icon: p.icon };
 }
 
 export const STT_PROVIDERS: SttProviderInfo[] = [
